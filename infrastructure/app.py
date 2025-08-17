@@ -5,7 +5,6 @@ from aws_cdk import (
     aws_apigateway as apigateway,
     aws_dynamodb as dynamodb,
     aws_s3 as s3,
-    aws_cloudfront as cloudfront,
     aws_events as events,
     aws_events_targets as targets,
     aws_stepfunctions as sfn,
@@ -166,7 +165,7 @@ class CardArbitrageStack(cdk.Stack):
         )
     
     def create_frontend_infrastructure(self):
-        """Create S3 bucket and CloudFront for frontend"""
+        """Create S3 bucket for frontend"""
         self.website_bucket = s3.Bucket(self, "WebsiteBucket",
             website_index_document="index.html",
             website_error_document="error.html",
@@ -177,31 +176,6 @@ class CardArbitrageStack(cdk.Stack):
             ),
             removal_policy=RemovalPolicy.DESTROY,
             auto_delete_objects=True
-        )
-        
-        # CloudFront distribution
-        self.distribution = cloudfront.CloudFrontWebDistribution(self, "Distribution",
-            origin_configs=[
-                cloudfront.SourceConfiguration(
-                    s3_origin_source=cloudfront.S3OriginConfig(
-                        s3_bucket_source=self.website_bucket
-                    ),
-                    behaviors=[
-                        cloudfront.Behavior(
-                            is_default_behavior=True,
-                            cached_methods=cloudfront.CloudFrontAllowedCachedMethods.GET_HEAD_OPTIONS,
-                            compress=True
-                        )
-                    ]
-                )
-            ],
-            error_configurations=[
-                cloudfront.CfnDistribution.CustomErrorResponseProperty(
-                    error_code=404,
-                    response_code=200,
-                    response_page_path="/index.html"
-                )
-            ]
         )
     
     def create_messaging_infrastructure(self):
@@ -591,27 +565,22 @@ class CardArbitrageStack(cdk.Stack):
             value=self.api.url,
             description="API Gateway endpoint URL"
         )
-        
-        cdk.CfnOutput(self, "WebsiteUrl",
-            value=f"https://{self.distribution.distribution_domain_name}",
-            description="CloudFront website URL"
+        cdk.CfnOutput(self, "WebsiteBucketName",
+            value=self.website_bucket.bucket_name,
+            description="S3 website bucket name"
         )
-        
         cdk.CfnOutput(self, "ListingsTableName",
             value=self.listings_table.table_name,
             description="DynamoDB listings table name"
         )
-        
         cdk.CfnOutput(self, "OpportunitiesTableName",
             value=self.opportunities_table.table_name,
             description="DynamoDB opportunities table name"
         )
-        
         cdk.CfnOutput(self, "StateMachineArn",
             value=self.arbitrage_state_machine.state_machine_arn,
             description="Step Functions state machine ARN"
         )
-        
         cdk.CfnOutput(self, "EbayCredentialsSecret",
             value=self.ebay_credentials.secret_name,
             description="eBay credentials secret name"
