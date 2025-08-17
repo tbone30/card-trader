@@ -1,125 +1,415 @@
-# lambda_functions/api_handler/handler.py - DynamoDB version
+"""
+Fixed API Handler Lambda function with comprehensive error handling
+"""
+
 import json
 import boto3
 import os
+import time
+import logging
 from decimal import Decimal
-from boto3.dynamodb.conditions import Key
+from datetime import datetime, timedelta
+from boto3.dynamodb.conditions import Key, Attr
+from botocore.exceptions import ClientError
 
-# Custom JSON encoder for Decimal
-class DecimalEncoder(json.JSONEncoder):
-    def default(self, obj):
-        if isinstance(obj, Decimal):
-            return float(obj)
-        return super(DecimalEncoder, self).default(obj)
+# Import shared utilities
+try:
+    from shared_utils import (
+        APIError, DecimalEncoder, create_response, validate_card_name,
+        get_current_timestamp, safe_decimal, safe_float, log_execution_metrics
+    )
+except ImportError:
+    # Fallback if shared utilities aren't available
+    class APIError(Exception):
+        def __init__(self, message, status_code=500, error_type="InternalError"):
+            self.message = message
+            self.status_code = status_code
+            self.error_type = error_type
+            super().__init__(self.message)
+    
+    class DecimalEncoder(json.JSONEncoder):
+        def default(self, obj):
+            if isinstance(obj, Decimal):
+                return float(obj)
+            return super().default(obj)
+    
+    def create_response(status_code, body, headers=None):
+        return {
+            'statusCode': status_code,
+            'headers': {
+                'Access-Control-Allow-Origin': '*',
+                'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+                'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+                'Content-Type': 'application/json'
+            },
+            'body': json.dumps(body, cls=DecimalEncoder)
+        }
+    
+    def validate_card_name(card_name):
+        if not card_name or len(card_name.strip()) < 2:
+            raise APIError("Valid card name required", 400, "BadRequest")
+        return card_name.strip()
+    
+    def log_execution_metrics(name, start_time, processed=0, errors=0):
+        print(f"METRICS: {name} - {time.time() - start_time:.2f}s, {processed} processed, {errors} errors")
+
+# Configure logging
+logger = logging.getLogger()
+logger.setLevel(os.environ.get('LOG_LEVEL', 'INFO'))
 
 def lambda_handler(event, context):
-    http_method = event.get('httpMethod', '')
-    path = event.get('path', '')
+    """Main Lambda handler with comprehensive routing and error handling"""
+    start_time = time.time()
     
     try:
-        if http_method == 'GET' and path == '/opportunities':
-            return get_opportunities(event)
+        # Log incoming request
+        logger.info(f"Received request: {event.get('httpMethod')} {event.get('path')}")
+        
+        # Extract request details
+        http_method = event.get('httpMethod', '').upper()
+        path = event.get('path', '').rstrip('/')
+        
+        # Route to appropriate handler
+        if http_method == 'OPTIONS':
+            return handle_options()
+        elif http_method == 'GET' and path == '/health':
+            return handle_health_check()
+        elif http_method == 'GET' and path == '/opportunities':
+            return handle_get_opportunities(event)
         elif http_method == 'POST' and path == '/search':
-            return trigger_search(event)
+            return handle_trigger_search(event)
+        elif http_method == 'GET' and path.startswith('/opportunities/'):
+            return handle_get_opportunity_details(event)
         else:
-            return create_response(404, {'error': 'Not found'})
+            logger.warning(f"Unknown route: {http_method} {path}")
+            return create_response(404, {
+                'error': 'Not Found',
+                'message': f'Route {http_method} {path} not found'
+            })
+    
+    except APIError as e:
+        logger.error(f"API Error: {e.message}")
+        return create_response(e.status_code, {
+            'error': e.error_type,
+            'message': e.message
+        })
+    
     except Exception as e:
-        print(f"Error in API handler: {str(e)}")
-        return create_response(500, {'error': 'Internal server error'})
+        logger.error(f"Unexpected error in API handler: {str(e)}", exc_info=True)
+        return create_response(500, {
+            'error': 'InternalError',
+            'message': 'An unexpected error occurred'
+        })
+    
+    finally:
+        log_execution_metrics('api_handler', start_time)
 
-def get_opportunities(event):
-    """Get arbitrage opportunities from DynamoDB"""
-    dynamodb = boto3.resource('dynamodb')
-    opportunities_table = dynamodb.Table(os.environ['OPPORTUNITIES_TABLE_NAME'])
-    
-    # Query parameters
-    query_params = event.get('queryStringParameters') or {}
-    limit = int(query_params.get('limit', 50))
-    min_profit_margin = float(query_params.get('min_profit_margin', 0.15))
-    
+def handle_options():
+    """Handle CORS preflight requests"""
+    return create_response(200, {}, {
+        'Access-Control-Allow-Origin': '*',
+        'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+        'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Requested-With',
+        'Access-Control-Max-Age': '86400'
+    })
+
+def handle_health_check():
+    """Health check endpoint"""
     try:
-        # Use GSI to query by profit margin
-        response = opportunities_table.query(
+        # Test DynamoDB connectivity
+        dynamodb = boto3.resource('dynamodb')
+        opportunities_table = dynamodb.Table(os.environ['OPPORTUNITIES_TABLE_NAME'])
+        
+        # Simple query to test connectivity
+        opportunities_table.query(
             IndexName='profit-margin-index',
             KeyConditionExpression=Key('status').eq('ACTIVE'),
-            FilterExpression=Key('profit_margin').gte(min_profit_margin),
-            ScanIndexForward=False,  # Sort descending
-            Limit=limit
+            Limit=1
         )
-        
-        opportunities = []
-        for item in response.get('Items', []):
-            opportunity = {
-                'card_name': item.get('card_name', ''),
-                'buy_platform': item.get('buy_platform', ''),
-                'sell_platform': item.get('sell_platform', ''),
-                'buy_price': float(item.get('buy_price', 0)),
-                'sell_price': float(item.get('sell_price', 0)),
-                'profit_amount': float(item.get('profit_amount', 0)),
-                'profit_margin': float(item.get('profit_margin', 0)),
-                'risk_score': float(item.get('risk_score', 0)),
-                'confidence_level': float(item.get('confidence_level', 0)),
-                'buy_url': item.get('buy_url', ''),
-                'created_at': item.get('created_at', ''),
-                'expires_at': item.get('expires_at', '')
-            }
-            opportunities.append(opportunity)
         
         return create_response(200, {
-            'opportunities': opportunities,
-            'count': len(opportunities),
-            'has_more': 'LastEvaluatedKey' in response
+            'status': 'healthy',
+            'timestamp': get_current_timestamp(),
+            'version': '1.0.0'
         })
         
     except Exception as e:
-        print(f"Error querying opportunities: {str(e)}")
-        return create_response(500, {'error': 'Failed to fetch opportunities'})
+        logger.error(f"Health check failed: {str(e)}")
+        return create_response(503, {
+            'status': 'unhealthy',
+            'error': 'Database connectivity issue',
+            'timestamp': get_current_timestamp()
+        })
 
-def trigger_search(event):
-    """Trigger arbitrage search workflow"""
+def handle_get_opportunities(event):
+    """Get arbitrage opportunities with filtering and pagination"""
     try:
-        body = json.loads(event.get('body', '{}'))
-        card_name = body.get('card_name', '').strip()
+        # Parse query parameters
+        query_params = event.get('queryStringParameters') or {}
         
-        if not card_name:
-            return create_response(400, {'error': 'card_name is required'})
+        # Pagination parameters
+        limit = min(int(query_params.get('limit', 50)), 100)  # Cap at 100
+        last_evaluated_key = query_params.get('last_evaluated_key')
         
-        # Start Step Functions workflow
-        stepfunctions = boto3.client('stepfunctions')
+        # Filter parameters
+        min_profit_margin = safe_decimal(query_params.get('min_profit_margin', '0.15'))
+        max_risk_score = safe_decimal(query_params.get('max_risk_score', '2.0'))
+        card_name = query_params.get('card_name', '').strip()
+        platform_pair = query_params.get('platform_pair', '').strip()
         
-        execution_input = {
-            'card_name': card_name,
-            'max_price': body.get('max_price', 1000),
-            'include_sold_data': body.get('include_sold_data', True),
-            'requester_id': event.get('requestContext', {}).get('requestId', '')
+        # Connect to DynamoDB
+        dynamodb = boto3.resource('dynamodb')
+        opportunities_table = dynamodb.Table(os.environ['OPPORTUNITIES_TABLE_NAME'])
+        
+        # Build query parameters
+        query_kwargs = {
+            'IndexName': 'profit-margin-index',
+            'KeyConditionExpression': Key('status').eq('ACTIVE'),
+            'ScanIndexForward': False,  # Sort by profit margin descending
+            'Limit': limit
         }
         
-        response = stepfunctions.start_execution(
-            stateMachineArn=os.environ['ARBITRAGE_STATE_MACHINE_ARN'],
-            input=json.dumps(execution_input, cls=DecimalEncoder)
+        # Add filter expressions
+        filter_expressions = []
+        if min_profit_margin > 0:
+            filter_expressions.append(Attr('profit_margin').gte(min_profit_margin))
+        if max_risk_score < 5:
+            filter_expressions.append(Attr('risk_score').lte(max_risk_score))
+        if card_name:
+            filter_expressions.append(Attr('card_name').contains(card_name))
+        if platform_pair:
+            filter_expressions.append(Attr('platform_pair').eq(platform_pair))
+        
+        if filter_expressions:
+            query_kwargs['FilterExpression'] = filter_expressions[0]
+            for expr in filter_expressions[1:]:
+                query_kwargs['FilterExpression'] = query_kwargs['FilterExpression'] & expr
+        
+        # Handle pagination
+        if last_evaluated_key:
+            try:
+                query_kwargs['ExclusiveStartKey'] = json.loads(last_evaluated_key)
+            except json.JSONDecodeError:
+                raise APIError("Invalid pagination token", 400, "BadRequest")
+        
+        # Execute query
+        response = opportunities_table.query(**query_kwargs)
+        
+        # Process opportunities
+        opportunities = []
+        for item in response.get('Items', []):
+            opportunity = format_opportunity_response(item)
+            opportunities.append(opportunity)
+        
+        # Prepare response
+        result = {
+            'opportunities': opportunities,
+            'count': len(opportunities),
+            'total_scanned': response.get('ScannedCount', 0),
+            'filters_applied': {
+                'min_profit_margin': float(min_profit_margin),
+                'max_risk_score': float(max_risk_score),
+                'card_name': card_name or None,
+                'platform_pair': platform_pair or None
+            }
+        }
+        
+        # Add pagination info
+        if 'LastEvaluatedKey' in response:
+            result['has_more'] = True
+            result['next_page_token'] = json.dumps(response['LastEvaluatedKey'], cls=DecimalEncoder)
+        else:
+            result['has_more'] = False
+        
+        return create_response(200, result)
+        
+    except ClientError as e:
+        logger.error(f"DynamoDB error: {str(e)}")
+        raise APIError("Database query failed", 500, "InternalError")
+    except Exception as e:
+        logger.error(f"Error getting opportunities: {str(e)}")
+        raise APIError("Failed to retrieve opportunities", 500, "InternalError")
+
+def handle_get_opportunity_details(event):
+    """Get details for a specific opportunity"""
+    try:
+        # Extract opportunity ID from path
+        path_parts = event.get('path', '').split('/')
+        if len(path_parts) < 3:
+            raise APIError("Invalid opportunity ID", 400, "BadRequest")
+        
+        opportunity_id = path_parts[2]
+        
+        # Parse opportunity ID (format: card_name#timestamp)
+        try:
+            card_name, created_at = opportunity_id.split('#', 1)
+            card_name = card_name.replace('%20', ' ')  # URL decode
+        except ValueError:
+            raise APIError("Invalid opportunity ID format", 400, "BadRequest")
+        
+        # Query DynamoDB
+        dynamodb = boto3.resource('dynamodb')
+        opportunities_table = dynamodb.Table(os.environ['OPPORTUNITIES_TABLE_NAME'])
+        
+        response = opportunities_table.get_item(
+            Key={
+                'card_name': card_name,
+                'created_at': created_at
+            }
         )
         
-        return create_response(202, {
-            'message': 'Search initiated successfully',
-            'execution_arn': response['executionArn'],
-            'card_name': card_name
-        })
+        if 'Item' not in response:
+            raise APIError("Opportunity not found", 404, "NotFound")
         
-    except json.JSONDecodeError:
-        return create_response(400, {'error': 'Invalid JSON in request body'})
+        opportunity = format_opportunity_response(response['Item'], include_details=True)
+        
+        return create_response(200, {'opportunity': opportunity})
+        
+    except APIError:
+        raise
     except Exception as e:
-        print(f"Error triggering search: {str(e)}")
-        return create_response(500, {'error': 'Failed to start search'})
+        logger.error(f"Error getting opportunity details: {str(e)}")
+        raise APIError("Failed to retrieve opportunity details", 500, "InternalError")
 
-def create_response(status_code, body):
-    """Create standardized API response"""
-    return {
-        'statusCode': status_code,
-        'headers': {
-            'Access-Control-Allow-Origin': '*',
-            'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-            'Access-Control-Allow-Headers': 'Content-Type, Authorization',
-            'Content-Type': 'application/json'
-        },
-        'body': json.dumps(body, cls=DecimalEncoder)
+def handle_trigger_search(event):
+    """Trigger arbitrage search workflow"""
+    try:
+        # Parse request body
+        try:
+            body = json.loads(event.get('body', '{}'))
+        except json.JSONDecodeError:
+            raise APIError("Invalid JSON in request body", 400, "BadRequest")
+        
+        # Validate required parameters
+        card_name = validate_card_name(body.get('card_name', ''))
+        
+        # Optional parameters with defaults
+        max_price = safe_decimal(body.get('max_price', '1000'))
+        include_sold_data = body.get('include_sold_data', True)
+        priority = body.get('priority', 'normal')  # normal, high
+        
+        # Validate parameters
+        if max_price <= 0 or max_price > 10000:
+            raise APIError("max_price must be between 1 and 10000", 400, "BadRequest")
+        
+        if priority not in ['normal', 'high']:
+            raise APIError("priority must be 'normal' or 'high'", 400, "BadRequest")
+        
+        # Check for recent searches to prevent spam
+        if not check_search_rate_limit(card_name):
+            raise APIError("Search rate limit exceeded. Please wait before searching again.", 429, "RateLimitExceeded")
+        
+        # Prepare Step Functions input
+        execution_input = {
+            'card_name': card_name,
+            'max_price': float(max_price),
+            'include_sold_data': include_sold_data,
+            'priority': priority,
+            'requester_id': event.get('requestContext', {}).get('requestId', ''),
+            'timestamp': get_current_timestamp()
+        }
+        
+        # Start Step Functions execution
+        stepfunctions = boto3.client('stepfunctions')
+        
+        try:
+            response = stepfunctions.start_execution(
+                stateMachineArn=os.environ['ARBITRAGE_STATE_MACHINE_ARN'],
+                name=f"search-{card_name.replace(' ', '-').lower()}-{int(time.time())}",
+                input=json.dumps(execution_input, cls=DecimalEncoder)
+            )
+            
+            # Record the search request
+            record_search_request(card_name, execution_input)
+            
+            return create_response(202, {
+                'message': 'Search initiated successfully',
+                'execution_arn': response['executionArn'],
+                'card_name': card_name,
+                'search_id': response['executionArn'].split(':')[-1],
+                'estimated_completion_time': (datetime.utcnow() + timedelta(minutes=5)).isoformat()
+            })
+            
+        except ClientError as e:
+            error_code = e.response.get('Error', {}).get('Code', 'Unknown')
+            if error_code == 'ExecutionLimitExceeded':
+                raise APIError("Too many searches in progress. Please try again later.", 429, "RateLimitExceeded")
+            else:
+                logger.error(f"Step Functions error: {str(e)}")
+                raise APIError("Failed to start search workflow", 500, "InternalError")
+        
+    except APIError:
+        raise
+    except Exception as e:
+        logger.error(f"Error triggering search: {str(e)}")
+        raise APIError("Failed to initiate search", 500, "InternalError")
+
+def format_opportunity_response(item, include_details=False):
+    """Format DynamoDB item for API response"""
+    opportunity = {
+        'id': f"{item.get('card_name', '')}#{item.get('created_at', '')}",
+        'card_name': item.get('card_name', ''),
+        'buy_platform': item.get('buy_platform', ''),
+        'sell_platform': item.get('sell_platform', ''),
+        'buy_price': safe_float(item.get('buy_price', 0)),
+        'sell_price': safe_float(item.get('sell_price', 0)),
+        'profit_amount': safe_float(item.get('profit_amount', 0)),
+        'profit_margin': safe_float(item.get('profit_margin', 0)),
+        'risk_score': safe_float(item.get('risk_score', 0)),
+        'confidence_level': safe_float(item.get('confidence_level', 0)),
+        'created_at': item.get('created_at', ''),
+        'expires_at': item.get('expires_at', ''),
+        'status': item.get('status', 'UNKNOWN')
     }
+    
+    if include_details:
+        opportunity.update({
+            'buy_url': item.get('buy_url', ''),
+            'buy_shipping': safe_float(item.get('buy_shipping', 0)),
+            'buy_total': safe_float(item.get('buy_total', 0)),
+            'platform_fees': safe_float(item.get('platform_fees', 0)),
+            'buy_condition': item.get('buy_condition', 'Unknown'),
+            'sell_condition': item.get('sell_condition', 'Unknown'),
+            'buy_item_id': item.get('buy_item_id', ''),
+            'sell_item_id': item.get('sell_item_id', ''),
+            'platform_pair': item.get('platform_pair', '')
+        })
+    
+    return opportunity
+
+def check_search_rate_limit(card_name):
+    """Check if search is within rate limits (simple in-memory check)"""
+    # In production, use DynamoDB or Redis for distributed rate limiting
+    # For now, use simple in-memory rate limiting per Lambda container
+    
+    if not hasattr(check_search_rate_limit, 'search_history'):
+        check_search_rate_limit.search_history = {}
+    
+    current_time = time.time()
+    key = card_name.lower()
+    
+    # Clean old entries (older than 1 hour)
+    check_search_rate_limit.search_history = {
+        k: v for k, v in check_search_rate_limit.search_history.items()
+        if current_time - v < 3600
+    }
+    
+    # Check if card was searched recently (within 5 minutes)
+    if key in check_search_rate_limit.search_history:
+        if current_time - check_search_rate_limit.search_history[key] < 300:
+            return False
+    
+    # Record this search
+    check_search_rate_limit.search_history[key] = current_time
+    return True
+
+def record_search_request(card_name, search_params):
+    """Record search request for analytics (optional)"""
+    try:
+        # This could store search requests in DynamoDB for analytics
+        # For now, just log it
+        logger.info(f"Search request recorded: {card_name}, params: {search_params}")
+    except Exception as e:
+        logger.warning(f"Failed to record search request: {str(e)}")
+
+# Additional utility functions can be added here as needed
