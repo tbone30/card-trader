@@ -1,9 +1,10 @@
-# lambda_functions/ebay_scraper/handler.py
+# lambda_functions/ebay_scraper/handler.py - DynamoDB version
 import json
 import boto3
 import os
 import requests
 from datetime import datetime, timedelta
+from decimal import Decimal
 
 class EbayAPIClient:
     def __init__(self):
@@ -19,9 +20,13 @@ class EbayAPIClient:
             
         auth_url = "https://api.ebay.com/identity/v1/oauth2/token"
         
+        import base64
+        credentials = f"{self.client_id}:{self.client_secret}"
+        basic_auth = base64.b64encode(credentials.encode()).decode()
+        
         headers = {
             'Content-Type': 'application/x-www-form-urlencoded',
-            'Authorization': f'Basic {self._get_basic_auth()}'
+            'Authorization': f'Basic {basic_auth}'
         }
         
         data = {
@@ -33,16 +38,10 @@ class EbayAPIClient:
         token_data = response.json()
         
         self.access_token = token_data['access_token']
-        expires_in = token_data['expires_in']  # seconds
-        self.token_expires = datetime.utcnow() + timedelta(seconds=expires_in - 300)  # 5min buffer
+        expires_in = token_data['expires_in']
+        self.token_expires = datetime.utcnow() + timedelta(seconds=expires_in - 300)
         
         return self.access_token
-    
-    def _get_basic_auth(self):
-        """Create base64 encoded client credentials"""
-        import base64
-        credentials = f"{self.client_id}:{self.client_secret}"
-        return base64.b64encode(credentials.encode()).decode()
     
     def search_items(self, keywords, category_id='2536', max_price=100, limit=50):
         """Search eBay using Browse API"""
@@ -52,56 +51,32 @@ class EbayAPIClient:
         
         headers = {
             'Authorization': f'Bearer {token}',
-            'X-EBAY-C-MARKETPLACE-ID': 'EBAY_US',
-            'X-EBAY-C-ENDUSERCTX': 'affiliateCampaignId=<ePNCampaignId>,affiliateReferenceId=<referenceId>'
+            'X-EBAY-C-MARKETPLACE-ID': 'EBAY_US'
         }
         
         params = {
             'q': keywords,
             'category_ids': category_id,
-            'filter': f'price:[..{max_price}],priceCurrency:USD,buyingOptions:{FIXED_PRICE|AUCTION}',
+            'filter': f'price:[..{max_price}],priceCurrency:USD,buyingOptions:{{FIXED_PRICE,AUCTION}}',
             'sort': 'price',
             'limit': limit
         }
         
         response = requests.get(url, headers=headers, params=params)
         return response.json()
-    
-    def get_sold_prices(self, keywords, days_back=30):
-        """Get sold/completed listings for price analysis"""
-        token = self.get_access_token()
-        
-        # Use search with sold items filter
-        url = "https://api.ebay.com/buy/browse/v1/item_summary/search"
-        
-        headers = {
-            'Authorization': f'Bearer {token}',
-            'X-EBAY-C-MARKETPLACE-ID': 'EBAY_US'
-        }
-        
-        end_date = datetime.utcnow()
-        start_date = end_date - timedelta(days=days_back)
-        
-        params = {
-            'q': keywords,
-            'category_ids': '2536',
-            'filter': f'conditionIds:{1000|1500|2000|2500|3000},soldDate:[{start_date.isoformat()}..{end_date.isoformat()}]',
-            'fieldgroups': 'MATCHING_ITEMS,EXTENDED',
-            'limit': 200
-        }
-        
-        response = requests.get(url, headers=headers, params=params)
-        return response.json()
 
 def lambda_handler(event, context):
+    """Main handler for eBay scraping"""
     try:
         ebay_client = EbayAPIClient()
-        rds_data = boto3.client('rds-data')
+        dynamodb = boto3.resource('dynamodb')
+        listings_table = dynamodb.Table(os.environ['LISTINGS_TABLE_NAME'])
         
         # Get parameters from event
         card_name = event['card_name']
-        max_price = event.get('max_price', 100)
-        include_sold = event.get('include_sold_data', True)
+        max_price = event.get('max_price', 1000)
+        
+        print(f"Starting eBay scrape for: {card_name}, max price: {max_price}")
         
         # Search current listings
         current_listings = ebay_client.search_items(
@@ -111,127 +86,78 @@ def lambda_handler(event, context):
         )
         
         processed_items = 0
+        current_timestamp = datetime.utcnow().isoformat()
+        ttl_timestamp = int((datetime.utcnow() + timedelta(hours=24)).timestamp())
         
         if 'itemSummaries' in current_listings:
-            for item in current_listings['itemSummaries']:
-                try:
-                    # Extract item details
-                    item_id = item.get('itemId', '')
-                    title = item.get('title', '')
-                    price = float(item['price']['value']) if 'price' in item else 0.0
-                    currency = item['price']['currency'] if 'price' in item else 'USD'
-                    condition = item.get('condition', 'Unknown')
-                    item_url = item.get('itemWebUrl', '')
-                    
-                    # Extract shipping info
-                    shipping_cost = 0.0
-                    if 'shippingOptions' in item and item['shippingOptions']:
-                        shipping_option = item['shippingOptions'][0]
-                        if 'shippingCost' in shipping_option:
-                            shipping_cost = float(shipping_option['shippingCost']['value'])
-                    
-                    # Extract seller info
-                    seller_username = item.get('seller', {}).get('username', '')
-                    seller_rating = item.get('seller', {}).get('feedbackPercentage', 0)
-                    
-                    # Insert into database
-                    rds_data.execute_statement(
-                        resourceArn=os.environ['DATABASE_ARN'],
-                        secretArn=os.environ['DATABASE_SECRET_ARN'],
-                        database='carddb',
-                        sql="""
-                            INSERT INTO listings (
-                                ebay_item_id, card_name, platform, title, price, currency,
-                                shipping_cost, condition, listing_url, seller_username,
-                                seller_rating, listing_type, scraped_at, is_active
-                            ) VALUES (
-                                :item_id, :card_name, 'ebay', :title, :price, :currency,
-                                :shipping_cost, :condition, :url, :seller_username,
-                                :seller_rating, :listing_type, NOW(), true
-                            )
-                            ON CONFLICT (ebay_item_id) DO UPDATE SET
-                                price = EXCLUDED.price,
-                                shipping_cost = EXCLUDED.shipping_cost,
-                                scraped_at = NOW()
-                        """,
-                        parameters=[
-                            {'name': 'item_id', 'value': {'stringValue': item_id}},
-                            {'name': 'card_name', 'value': {'stringValue': card_name}},
-                            {'name': 'title', 'value': {'stringValue': title}},
-                            {'name': 'price', 'value': {'doubleValue': price}},
-                            {'name': 'currency', 'value': {'stringValue': currency}},
-                            {'name': 'shipping_cost', 'value': {'doubleValue': shipping_cost}},
-                            {'name': 'condition', 'value': {'stringValue': condition}},
-                            {'name': 'url', 'value': {'stringValue': item_url}},
-                            {'name': 'seller_username', 'value': {'stringValue': seller_username}},
-                            {'name': 'seller_rating', 'value': {'doubleValue': float(seller_rating)}},
-                            {'name': 'listing_type', 'value': {'stringValue': 'FIXED_PRICE'}}
-                        ]
-                    )
-                    processed_items += 1
-                    
-                except Exception as item_error:
-                    print(f"Error processing item {item.get('itemId', 'unknown')}: {str(item_error)}")
-                    continue
+            # Process items in batches for DynamoDB
+            with listings_table.batch_writer() as batch:
+                for item in current_listings['itemSummaries']:
+                    try:
+                        # Extract item details
+                        item_id = item.get('itemId', '')
+                        title = item.get('title', '')[:255]  # DynamoDB string limit
+                        price = Decimal(str(item['price']['value'])) if 'price' in item else Decimal('0')
+                        currency = item['price']['currency'] if 'price' in item else 'USD'
+                        condition = item.get('condition', 'Unknown')
+                        item_url = item.get('itemWebUrl', '')
+                        
+                        # Extract shipping info
+                        shipping_cost = Decimal('0')
+                        if 'shippingOptions' in item and item['shippingOptions']:
+                            shipping_option = item['shippingOptions'][0]
+                            if 'shippingCost' in shipping_option:
+                                shipping_cost = Decimal(str(shipping_option['shippingCost']['value']))
+                        
+                        # Extract seller info
+                        seller_username = item.get('seller', {}).get('username', '')
+                        seller_rating = Decimal(str(item.get('seller', {}).get('feedbackPercentage', 0)))
+                        
+                        # Create DynamoDB item
+                        listing_item = {
+                            'platform_card': f"ebay#{card_name.lower().replace(' ', '_')}",
+                            'item_id': item_id,
+                            'card_name': card_name,
+                            'platform': 'ebay',
+                            'title': title,
+                            'price': price,
+                            'currency': currency,
+                            'shipping_cost': shipping_cost,
+                            'total_cost': price + shipping_cost,
+                            'condition': condition,
+                            'listing_url': item_url,
+                            'seller_username': seller_username,
+                            'seller_rating': seller_rating,
+                            'listing_type': 'FIXED_PRICE',
+                            'scraped_at': current_timestamp,
+                            'is_active': True,
+                            'ttl': ttl_timestamp
+                        }
+                        
+                        batch.put_item(Item=listing_item)
+                        processed_items += 1
+                        
+                    except Exception as item_error:
+                        print(f"Error processing item {item.get('itemId', 'unknown')}: {str(item_error)}")
+                        continue
         
-        # Get sold prices for market analysis
-        sold_data_count = 0
-        if include_sold:
-            try:
-                sold_listings = ebay_client.get_sold_prices(card_name, days_back=30)
-                
-                if 'itemSummaries' in sold_listings:
-                    for sold_item in sold_listings['itemSummaries']:
-                        try:
-                            sold_price = float(sold_item['price']['value']) if 'price' in sold_item else 0.0
-                            sold_date = sold_item.get('itemEndDate', datetime.utcnow().isoformat())
-                            
-                            # Insert sold price data
-                            rds_data.execute_statement(
-                                resourceArn=os.environ['DATABASE_ARN'],
-                                secretArn=os.environ['DATABASE_SECRET_ARN'],
-                                database='carddb',
-                                sql="""
-                                    INSERT INTO sold_prices (
-                                        card_name, platform, price, condition, sold_date, title
-                                    ) VALUES (
-                                        :card_name, 'ebay', :price, :condition, :sold_date, :title
-                                    )
-                                """,
-                                parameters=[
-                                    {'name': 'card_name', 'value': {'stringValue': card_name}},
-                                    {'name': 'price', 'value': {'doubleValue': sold_price}},
-                                    {'name': 'condition', 'value': {'stringValue': sold_item.get('condition', 'Unknown')}},
-                                    {'name': 'sold_date', 'value': {'stringValue': sold_date}},
-                                    {'name': 'title', 'value': {'stringValue': sold_item.get('title', '')}}
-                                ]
-                            )
-                            sold_data_count += 1
-                            
-                        except Exception as sold_error:
-                            print(f"Error processing sold item: {str(sold_error)}")
-                            continue
-                            
-            except Exception as sold_error:
-                print(f"Error fetching sold data: {str(sold_error)}")
+        print(f"Successfully processed {processed_items} eBay listings")
         
-        # Return success response
+        # Return success response for Step Functions
         return {
             'statusCode': 200,
-            'body': json.dumps({
-                'message': 'eBay data successfully processed',
-                'items_processed': processed_items,
-                'sold_items_processed': sold_data_count,
-                'card_name': card_name
-            })
+            'platform': 'ebay',
+            'card_name': card_name,
+            'items_processed': processed_items,
+            'timestamp': current_timestamp
         }
         
     except Exception as e:
         print(f"Error in eBay scraper: {str(e)}")
+        # Return error for Step Functions to handle
         return {
             'statusCode': 500,
-            'body': json.dumps({
-                'error': 'Failed to process eBay data',
-                'details': str(e)
-            })
+            'platform': 'ebay',
+            'error': str(e),
+            'timestamp': datetime.utcnow().isoformat()
         }
