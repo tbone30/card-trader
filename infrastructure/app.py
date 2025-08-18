@@ -97,31 +97,32 @@ class CardArbitrageStack(cdk.Stack):
             billing_mode=dynamodb.BillingMode.PAY_PER_REQUEST,
             time_to_live_attribute="ttl",
             removal_policy=RemovalPolicy.DESTROY,
-            point_in_time_recovery=True,
-            global_secondary_indexes=[
-                dynamodb.GlobalSecondaryIndexProps(
-                    index_name="card-name-index",
-                    partition_key=dynamodb.Attribute(
-                        name="card_name", 
-                        type=dynamodb.AttributeType.STRING
-                    ),
-                    sort_key=dynamodb.Attribute(
-                        name="price", 
-                        type=dynamodb.AttributeType.NUMBER
-                    )
-                ),
-                dynamodb.GlobalSecondaryIndexProps(
-                    index_name="platform-index",
-                    partition_key=dynamodb.Attribute(
-                        name="platform", 
-                        type=dynamodb.AttributeType.STRING
-                    ),
-                    sort_key=dynamodb.Attribute(
-                        name="scraped_at", 
-                        type=dynamodb.AttributeType.STRING
-                    )
-                )
-            ]
+            point_in_time_recovery=True
+        )
+        
+        # Add GSIs to the listings table
+        self.listings_table.add_global_secondary_index(
+            index_name="card-name-index",
+            partition_key=dynamodb.Attribute(
+                name="card_name", 
+                type=dynamodb.AttributeType.STRING
+            ),
+            sort_key=dynamodb.Attribute(
+                name="price", 
+                type=dynamodb.AttributeType.NUMBER
+            )
+        )
+        
+        self.listings_table.add_global_secondary_index(
+            index_name="platform-index",
+            partition_key=dynamodb.Attribute(
+                name="platform", 
+                type=dynamodb.AttributeType.STRING
+            ),
+            sort_key=dynamodb.Attribute(
+                name="scraped_at", 
+                type=dynamodb.AttributeType.STRING
+            )
         )
         
         # Opportunities table
@@ -138,31 +139,32 @@ class CardArbitrageStack(cdk.Stack):
             billing_mode=dynamodb.BillingMode.PAY_PER_REQUEST,
             time_to_live_attribute="ttl",
             removal_policy=RemovalPolicy.DESTROY,
-            point_in_time_recovery=True,
-            global_secondary_indexes=[
-                dynamodb.GlobalSecondaryIndexProps(
-                    index_name="profit-margin-index",
-                    partition_key=dynamodb.Attribute(
-                        name="status", 
-                        type=dynamodb.AttributeType.STRING
-                    ),
-                    sort_key=dynamodb.Attribute(
-                        name="profit_margin", 
-                        type=dynamodb.AttributeType.NUMBER
-                    )
-                ),
-                dynamodb.GlobalSecondaryIndexProps(
-                    index_name="platform-pair-index",
-                    partition_key=dynamodb.Attribute(
-                        name="platform_pair", 
-                        type=dynamodb.AttributeType.STRING
-                    ),
-                    sort_key=dynamodb.Attribute(
-                        name="profit_amount", 
-                        type=dynamodb.AttributeType.NUMBER
-                    )
-                )
-            ]
+            point_in_time_recovery=True
+        )
+        
+        # Add GSIs to the opportunities table
+        self.opportunities_table.add_global_secondary_index(
+            index_name="profit-margin-index",
+            partition_key=dynamodb.Attribute(
+                name="status", 
+                type=dynamodb.AttributeType.STRING
+            ),
+            sort_key=dynamodb.Attribute(
+                name="profit_margin", 
+                type=dynamodb.AttributeType.NUMBER
+            )
+        )
+        
+        self.opportunities_table.add_global_secondary_index(
+            index_name="platform-pair-index",
+            partition_key=dynamodb.Attribute(
+                name="platform_pair", 
+                type=dynamodb.AttributeType.STRING
+            ),
+            sort_key=dynamodb.Attribute(
+                name="profit_amount", 
+                type=dynamodb.AttributeType.NUMBER
+            )
         )
     
     def create_frontend_infrastructure(self):
@@ -189,7 +191,7 @@ class CardArbitrageStack(cdk.Stack):
         # Main scraping queue
         self.scraping_queue = sqs.Queue(self, "ScrapingQueue",
             visibility_timeout=Duration.minutes(15),
-            message_retention_period=Duration.days(1),
+            retention_period=Duration.days(1),
             dead_letter_queue=sqs.DeadLetterQueue(
                 max_receive_count=3,
                 queue=self.dlq
@@ -338,7 +340,17 @@ class CardArbitrageStack(cdk.Stack):
             description="API for card arbitrage opportunities",
             deploy_options=apigateway.StageOptions(
                 access_log_destination=apigateway.LogGroupLogDestination(api_log_group),
-                access_log_format=apigateway.AccessLogFormat.json_with_standard_fields(),
+                access_log_format=apigateway.AccessLogFormat.json_with_standard_fields(
+                    caller=True,
+                    http_method=True,
+                    ip=True,
+                    protocol=True,
+                    request_time=True,
+                    resource_path=True,
+                    response_length=True,
+                    status=True,
+                    user=True
+                ),
                 logging_level=apigateway.MethodLoggingLevel.INFO,
                 data_trace_enabled=True,
                 metrics_enabled=True
@@ -431,13 +443,13 @@ class CardArbitrageStack(cdk.Stack):
         scrape_ebay_task = tasks.LambdaInvoke(self, "ScrapeEbayTask",
             lambda_function=self.ebay_scraper_lambda,
             output_path="$.Payload",
-            retry_on_service_exceptions=True,
-            retry=sfn.RetryProps(
-                errors=["States.TaskFailed", "States.ALL"],
-                interval=Duration.seconds(30),
-                max_attempts=3,
-                backoff_rate=2.0
-            )
+            retry_on_service_exceptions=True
+        )
+        scrape_ebay_task.add_retry(
+            errors=["States.ALL"],
+            interval=Duration.seconds(30),
+            max_attempts=3,
+            backoff_rate=2.0
         )
         
         # TCG Scraper task - commented out as no API access
@@ -456,13 +468,13 @@ class CardArbitrageStack(cdk.Stack):
         detect_arbitrage_task = tasks.LambdaInvoke(self, "DetectArbitrageTask",
             lambda_function=self.arbitrage_detector_lambda,
             output_path="$.Payload",
-            retry_on_service_exceptions=True,
-            retry=sfn.RetryProps(
-                errors=["States.TaskFailed"],
-                interval=Duration.seconds(30),
-                max_attempts=2,
-                backoff_rate=2.0
-            )
+            retry_on_service_exceptions=True
+        )
+        detect_arbitrage_task.add_retry(
+            errors=["States.TaskFailed"],
+            interval=Duration.seconds(30),
+            max_attempts=2,
+            backoff_rate=2.0
         )
         
         send_notifications_task = tasks.LambdaInvoke(self, "SendNotificationsTask",
@@ -571,7 +583,7 @@ class CardArbitrageStack(cdk.Stack):
             value=self.api.url,
             description="API Gateway endpoint URL"
         )
-        cdk.CfnOutput(self, "WebsiteBucket", 
+        cdk.CfnOutput(self, "WebsiteBucketOutput", 
             value=self.website_bucket.bucket_name,
             description="S3 website bucket name"
         )
