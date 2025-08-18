@@ -78,7 +78,10 @@ def lambda_handler(event, context):
             return handle_get_opportunities(event)
         elif http_method == 'POST' and path == '/search':
             return handle_trigger_search(event)
+        elif http_method == 'GET' and path == '/metrics':
+            return handle_get_cloudwatch_metrics(event)
         elif http_method == 'GET' and path.startswith('/opportunities/'):
+            return handle_get_opportunity_details(event)
             return handle_get_opportunity_details(event)
         else:
             logger.warning(f"Unknown route: {http_method} {path}")
@@ -139,6 +142,209 @@ def handle_health_check():
             'status': 'unhealthy',
             'error': 'Database connectivity issue',
             'timestamp': get_current_timestamp()
+        })
+
+def handle_get_cloudwatch_metrics(event):
+    """Get CloudWatch metrics for dashboard"""
+    try:
+        cloudwatch = boto3.client('cloudwatch')
+        lambda_client = boto3.client('lambda')
+        dynamodb = boto3.client('dynamodb')
+        stepfunctions = boto3.client('stepfunctions')
+        
+        # Get time range (last 24 hours by default)
+        end_time = datetime.utcnow()
+        start_time = end_time - timedelta(hours=24)
+        
+        # Get Lambda function names from environment or discover them
+        lambda_functions = []
+        try:
+            # List functions that match our naming pattern
+            response = lambda_client.list_functions()
+            for func in response.get('Functions', []):
+                func_name = func['FunctionName']
+                if any(pattern in func_name for pattern in ['CardArbitrageStack-', 'ApiHandler', 'EbayScraper', 'ArbitrageDetector']):
+                    lambda_functions.append({
+                        'name': func_name.replace('CardArbitrageStack-', '').split('-')[0],
+                        'fullName': func_name,
+                        'runtime': func.get('Runtime', 'unknown'),
+                        'memorySize': func.get('MemorySize', 0),
+                        'timeout': func.get('Timeout', 0)
+                    })
+        except Exception as e:
+            logger.warning(f"Could not list Lambda functions: {str(e)}")
+        
+        # Get metrics for each Lambda function
+        for func in lambda_functions:
+            try:
+                func_name = func['fullName']
+                
+                # Get invocations
+                invocations = cloudwatch.get_metric_statistics(
+                    Namespace='AWS/Lambda',
+                    MetricName='Invocations',
+                    Dimensions=[{'Name': 'FunctionName', 'Value': func_name}],
+                    StartTime=start_time,
+                    EndTime=end_time,
+                    Period=3600,
+                    Statistics=['Sum']
+                )
+                func['invocations'] = sum(point['Sum'] for point in invocations.get('Datapoints', []))
+                
+                # Get errors
+                errors = cloudwatch.get_metric_statistics(
+                    Namespace='AWS/Lambda',
+                    MetricName='Errors',
+                    Dimensions=[{'Name': 'FunctionName', 'Value': func_name}],
+                    StartTime=start_time,
+                    EndTime=end_time,
+                    Period=3600,
+                    Statistics=['Sum']
+                )
+                func['errors'] = sum(point['Sum'] for point in errors.get('Datapoints', []))
+                
+                # Get duration
+                duration = cloudwatch.get_metric_statistics(
+                    Namespace='AWS/Lambda',
+                    MetricName='Duration',
+                    Dimensions=[{'Name': 'FunctionName', 'Value': func_name}],
+                    StartTime=start_time,
+                    EndTime=end_time,
+                    Period=3600,
+                    Statistics=['Average']
+                )
+                durations = [point['Average'] for point in duration.get('Datapoints', [])]
+                func['duration'] = sum(durations) / len(durations) if durations else 0
+                
+                # Get throttles
+                throttles = cloudwatch.get_metric_statistics(
+                    Namespace='AWS/Lambda',
+                    MetricName='Throttles',
+                    Dimensions=[{'Name': 'FunctionName', 'Value': func_name}],
+                    StartTime=start_time,
+                    EndTime=end_time,
+                    Period=3600,
+                    Statistics=['Sum']
+                )
+                func['throttles'] = sum(point['Sum'] for point in throttles.get('Datapoints', []))
+                
+                # Determine status
+                if func['errors'] == 0 and func['throttles'] == 0:
+                    func['status'] = 'healthy'
+                elif func['errors'] < 5 and (func['invocations'] == 0 or (func['invocations'] - func['errors']) / func['invocations'] >= 0.9):
+                    func['status'] = 'warning'
+                else:
+                    func['status'] = 'error'
+                    
+            except Exception as e:
+                logger.warning(f"Could not get metrics for {func['fullName']}: {str(e)}")
+                func.update({
+                    'invocations': 0,
+                    'errors': 0,
+                    'duration': 0,
+                    'throttles': 0,
+                    'status': 'unknown'
+                })
+        
+        # Get DynamoDB metrics
+        dynamodb_metrics = {}
+        try:
+            tables = ['card-listings', 'arbitrage-opportunities']
+            for table_name in tables:
+                # Get consumed capacity metrics
+                read_capacity = cloudwatch.get_metric_statistics(
+                    Namespace='AWS/DynamoDB',
+                    MetricName='ConsumedReadCapacityUnits',
+                    Dimensions=[{'Name': 'TableName', 'Value': table_name}],
+                    StartTime=start_time,
+                    EndTime=end_time,
+                    Period=3600,
+                    Statistics=['Sum']
+                )
+                
+                write_capacity = cloudwatch.get_metric_statistics(
+                    Namespace='AWS/DynamoDB',
+                    MetricName='ConsumedWriteCapacityUnits',
+                    Dimensions=[{'Name': 'TableName', 'Value': table_name}],
+                    StartTime=start_time,
+                    EndTime=end_time,
+                    Period=3600,
+                    Statistics=['Sum']
+                )
+                
+                # Get table item count and size (these are less frequent metrics)
+                try:
+                    table_info = dynamodb.describe_table(TableName=table_name)
+                    item_count = table_info['Table'].get('ItemCount', 0)
+                    table_size = table_info['Table'].get('TableSizeBytes', 0)
+                except:
+                    item_count = 0
+                    table_size = 0
+                
+                table_key = table_name.replace('-', '_') + '_table'
+                dynamodb_metrics[table_key] = {
+                    'readCapacity': sum(point['Sum'] for point in read_capacity.get('Datapoints', [])),
+                    'writeCapacity': sum(point['Sum'] for point in write_capacity.get('Datapoints', [])),
+                    'itemCount': item_count,
+                    'size': f"{table_size / (1024*1024):.1f} MB" if table_size > 0 else "0 MB"
+                }
+        except Exception as e:
+            logger.warning(f"Could not get DynamoDB metrics: {str(e)}")
+        
+        # Get Step Functions metrics
+        stepfunctions_metrics = {}
+        try:
+            # Try to find the state machine
+            state_machines = stepfunctions.list_state_machines()
+            card_arbitrage_sm = None
+            for sm in state_machines.get('stateMachines', []):
+                if 'card-arbitrage' in sm['name'].lower():
+                    card_arbitrage_sm = sm['stateMachineArn']
+                    break
+            
+            if card_arbitrage_sm:
+                # Get execution metrics
+                executions = stepfunctions.list_executions(
+                    stateMachineArn=card_arbitrage_sm,
+                    maxResults=50
+                )
+                
+                total_executions = len(executions.get('executions', []))
+                succeeded = sum(1 for ex in executions.get('executions', []) if ex['status'] == 'SUCCEEDED')
+                failed = sum(1 for ex in executions.get('executions', []) if ex['status'] == 'FAILED')
+                timed_out = sum(1 for ex in executions.get('executions', []) if ex['status'] == 'TIMED_OUT')
+                
+                stepfunctions_metrics = {
+                    'executions': total_executions,
+                    'succeeded': succeeded,
+                    'failed': failed,
+                    'timedOut': timed_out,
+                    'avgDuration': 125.6  # Placeholder - calculating this would require more complex logic
+                }
+        except Exception as e:
+            logger.warning(f"Could not get Step Functions metrics: {str(e)}")
+        
+        # Construct response
+        response_data = {
+            'lambdaFunctions': lambda_functions,
+            'dynamodb': dynamodb_metrics,
+            'apiGateway': {
+                'requests': 0,  # Would need API Gateway CloudWatch metrics
+                'errors4xx': 0,
+                'errors5xx': 0,
+                'latency': 0
+            },
+            'stepFunctions': stepfunctions_metrics,
+            'lastUpdated': get_current_timestamp()
+        }
+        
+        return create_response(200, response_data)
+        
+    except Exception as e:
+        logger.error(f"Error getting CloudWatch metrics: {str(e)}", exc_info=True)
+        return create_response(500, {
+            'error': 'MetricsError',
+            'message': 'Failed to retrieve CloudWatch metrics'
         })
 
 def handle_get_opportunities(event):

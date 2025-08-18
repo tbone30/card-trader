@@ -155,19 +155,10 @@ const CardArbitrageDashboard = () => {
 
   return (
     <div className="min-h-screen bg-gradient-to-br from-slate-900 via-blue-900 to-indigo-900 text-white">
-      {/* Header */}
-      <div className="bg-black/20 backdrop-blur-sm border-b border-white/10">
-        <div className="container mx-auto px-6 py-4">
+      <div className="container mx-auto px-6 py-8 space-y-8">
+        {/* System Status Bar */}
+        <div className="bg-black/20 backdrop-blur-sm border border-white/10 rounded-xl p-4">
           <div className="flex items-center justify-between">
-            <div className="flex items-center space-x-3">
-              <div className="h-10 w-10 bg-gradient-to-r from-blue-500 to-purple-600 rounded-lg flex items-center justify-center">
-                <TrendingUp className="h-6 w-6" />
-              </div>
-              <div>
-                <h1 className="text-2xl font-bold">Card Arbitrage Dashboard</h1>
-                <p className="text-blue-300 text-sm">Real-time trading opportunity monitor</p>
-              </div>
-            </div>
             <div className="flex items-center space-x-4">
               <div className="flex items-center space-x-2">
                 {systemHealth?.status === 'healthy' ? (
@@ -179,18 +170,18 @@ const CardArbitrageDashboard = () => {
                   System {systemHealth?.status || 'Unknown'}
                 </span>
               </div>
-              <button
-                onClick={() => window.location.reload()}
-                className="p-2 bg-white/10 hover:bg-white/20 rounded-lg transition-colors"
-              >
-                <RefreshCw className="h-4 w-4" />
-              </button>
+              <div className="text-sm text-blue-300">
+                Real-time trading opportunity monitor
+              </div>
             </div>
+            <button
+              onClick={() => window.location.reload()}
+              className="p-2 bg-white/10 hover:bg-white/20 rounded-lg transition-colors"
+            >
+              <RefreshCw className="h-4 w-4" />
+            </button>
           </div>
         </div>
-      </div>
-
-      <div className="container mx-auto px-6 py-8 space-y-8">
         {/* System Stats */}
         <div className="grid grid-cols-1 md:grid-cols-4 gap-6">
           <div className="bg-white/10 backdrop-blur-sm rounded-xl p-6 border border-white/20">

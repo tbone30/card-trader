@@ -97,7 +97,9 @@ class CardArbitrageStack(cdk.Stack):
             billing_mode=dynamodb.BillingMode.PAY_PER_REQUEST,
             time_to_live_attribute="ttl",
             removal_policy=RemovalPolicy.DESTROY,
-            point_in_time_recovery=True
+            point_in_time_recovery_specification=dynamodb.PointInTimeRecoverySpecification(
+                point_in_time_recovery_enabled=True
+            )
         )
         
         # Add GSIs to the listings table
@@ -139,7 +141,9 @@ class CardArbitrageStack(cdk.Stack):
             billing_mode=dynamodb.BillingMode.PAY_PER_REQUEST,
             time_to_live_attribute="ttl",
             removal_policy=RemovalPolicy.DESTROY,
-            point_in_time_recovery=True
+            point_in_time_recovery_specification=dynamodb.PointInTimeRecoverySpecification(
+                point_in_time_recovery_enabled=True
+            )
         )
         
         # Add GSIs to the opportunities table
@@ -244,8 +248,7 @@ class CardArbitrageStack(cdk.Stack):
             environment=common_env,
             timeout=Duration.minutes(10),
             memory_size=1024,
-            retry_attempts=2,
-            reserved_concurrent_executions=10
+            retry_attempts=2
         )
         
         # TCG Player Scraper Lambda - commented out as no API access
@@ -506,7 +509,7 @@ class CardArbitrageStack(cdk.Stack):
         # Create state machine
         self.arbitrage_state_machine = sfn.StateMachine(self, "ArbitrageStateMachine",
             state_machine_name="card-arbitrage-workflow",
-            definition=workflow_definition,
+            definition_body=sfn.DefinitionBody.from_chainable(workflow_definition),
             timeout=Duration.minutes(30),
             logs=sfn.LogOptions(
                 destination=logs.LogGroup(self, "StepFunctionLogs",

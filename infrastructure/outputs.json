@@ -1,0 +1,12 @@
+{
+  "CardArbitrageStack": {
+    "WebsiteBucketOutput": "cardarbitragestack-websitebucket75c24d94-gqaau5kix9wk",
+    "CardArbitrageApiEndpoint92D11B76": "https://i82l8j1idk.execute-api.us-east-1.amazonaws.com/prod/",
+    "ListingsTableName": "card-listings",
+    "WebsiteUrl": "http://cardarbitragestack-websitebucket75c24d94-gqaau5kix9wk.s3-website-us-east-1.amazonaws.com",
+    "EbayCredentialsSecret": "card-arbitrage/ebay-credentials",
+    "ApiEndpoint": "https://i82l8j1idk.execute-api.us-east-1.amazonaws.com/prod/",
+    "StateMachineArn": "arn:aws:states:us-east-1:569187741421:stateMachine:card-arbitrage-workflow",
+    "OpportunitiesTableName": "arbitrage-opportunities"
+  }
+}
