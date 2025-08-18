@@ -34,9 +34,12 @@ class APIError(Exception):
 
 def get_secret(secret_name: str) -> Dict[str, Any]:
     """
-    Retrieve secrets from AWS Secrets Manager with caching
+    Retrieve secrets from AWS Secrets Manager with caching and comprehensive error handling
     """
     try:
+        if not secret_name:
+            raise ValueError("Secret name cannot be empty")
+        
         # Simple in-memory cache for secrets (Lambda container reuse)
         if not hasattr(get_secret, 'cache'):
             get_secret.cache = {}
@@ -46,23 +49,69 @@ def get_secret(secret_name: str) -> Dict[str, Any]:
         if cache_key in get_secret.cache:
             cached_secret, timestamp = get_secret.cache[cache_key]
             if time.time() - timestamp < 300:  # 5 minutes
+                logger.debug(f"Using cached secret for {secret_name}")
                 return cached_secret
         
-        client = boto3.client('secretsmanager')
-        response = client.get_secret_value(SecretId=secret_name)
-        secret_data = json.loads(response['SecretString'])
+        logger.info(f"Retrieving secret from AWS Secrets Manager: {secret_name}")
+        
+        # Create Secrets Manager client with retry configuration
+        client = boto3.client(
+            'secretsmanager',
+            config=boto3.session.Config(
+                retries={
+                    'max_attempts': 3,
+                    'mode': 'adaptive'
+                }
+            )
+        )
+        
+        try:
+            response = client.get_secret_value(SecretId=secret_name)
+        except ClientError as e:
+            error_code = e.response.get('Error', {}).get('Code', '')
+            if error_code == 'ResourceNotFoundException':
+                logger.error(f"Secret not found: {secret_name}")
+                raise APIError(f"Secret '{secret_name}' not found", 404, "NotFound")
+            elif error_code == 'InvalidRequestException':
+                logger.error(f"Invalid secret request: {secret_name}")
+                raise APIError(f"Invalid secret request for '{secret_name}'", 400, "BadRequest")
+            elif error_code == 'InvalidParameterException':
+                logger.error(f"Invalid parameter for secret: {secret_name}")
+                raise APIError(f"Invalid parameter for secret '{secret_name}'", 400, "BadRequest")
+            elif error_code in ['DecryptionFailureException', 'InternalServiceErrorException']:
+                logger.error(f"AWS Secrets Manager service error for {secret_name}: {error_code}")
+                raise APIError("Temporary secret service unavailable", 503, "ServiceUnavailable")
+            elif error_code == 'AccessDeniedException':
+                logger.error(f"Access denied to secret: {secret_name}")
+                raise APIError("Access denied to secret", 403, "Forbidden")
+            else:
+                logger.error(f"Unknown error retrieving secret {secret_name}: {str(e)}")
+                raise APIError("Failed to retrieve secret", 500, "InternalError")
+        
+        # Parse and validate secret data
+        try:
+            secret_data = json.loads(response['SecretString'])
+            if not isinstance(secret_data, dict):
+                raise ValueError("Secret must contain valid JSON object")
+        except json.JSONDecodeError as e:
+            logger.error(f"Invalid JSON in secret {secret_name}: {str(e)}")
+            raise APIError(f"Secret contains invalid JSON", 500, "ConfigurationError")
+        except ValueError as e:
+            logger.error(f"Invalid secret format for {secret_name}: {str(e)}")
+            raise APIError(f"Invalid secret format", 500, "ConfigurationError")
         
         # Cache the secret
         get_secret.cache[cache_key] = (secret_data, time.time())
+        logger.debug(f"Successfully cached secret: {secret_name}")
         
         return secret_data
         
-    except ClientError as e:
-        logger.error(f"Failed to retrieve secret {secret_name}: {str(e)}")
+    except APIError:
+        # Re-raise APIError as-is
+        raise
+    except Exception as e:
+        logger.error(f"Unexpected error retrieving secret {secret_name}: {str(e)}")
         raise APIError(f"Failed to retrieve credentials", 500, "ConfigurationError")
-    except json.JSONDecodeError as e:
-        logger.error(f"Invalid JSON in secret {secret_name}: {str(e)}")
-        raise APIError(f"Invalid credential format", 500, "ConfigurationError")
 
 def safe_decimal(value: Union[str, int, float], default: Decimal = Decimal('0')) -> Decimal:
     """
@@ -179,7 +228,7 @@ def calculate_platform_fees(platform: str, amount: Decimal) -> Decimal:
     """
     fee_rates = {
         'ebay': Decimal('0.125'),        # ~12.5% (final value fee + payment processing)
-        'tcgplayer': Decimal('0.11'),    # ~11% 
+        # 'tcgplayer': Decimal('0.11'),    # ~11% - commented out as no API access
         'comc': Decimal('0.20'),         # ~20%
         'mercari': Decimal('0.10'),      # ~10%
         'facebook': Decimal('0.05'),     # ~5% (Facebook Marketplace)
@@ -423,3 +472,90 @@ def validate_card_name(card_name: str) -> str:
         cleaned = cleaned[:255]
         logger.warning(f"Card name truncated to 255 characters: {cleaned}")
     return cleaned
+
+def validate_api_credentials(credentials: Dict[str, Any], platform: str) -> bool:
+    """
+    Validate API credentials for a specific platform
+    """
+    try:
+        if not isinstance(credentials, dict):
+            raise ValueError("Credentials must be a dictionary")
+        
+        # Platform-specific validation
+        if platform.lower() == 'ebay':
+            required_fields = ['client_id', 'client_secret']
+            placeholder_values = {
+                'client_id': ['your-ebay-client-id', 'test', ''],
+                'client_secret': ['your-ebay-client-secret', 'test', '']
+            }
+        # elif platform.lower() == 'tcgplayer':  # Commented out - no TCG API access
+        #     required_fields = ['public_key', 'private_key']
+        #     placeholder_values = {
+        #         'public_key': ['your-tcg-public-key', 'test', ''],
+        #         'private_key': ['your-tcg-private-key', 'test', '']
+        #     }
+        else:
+            logger.warning(f"Unknown platform for credential validation: {platform}")
+            return True  # Skip validation for unknown platforms
+        
+        # Check required fields exist
+        missing_fields = [field for field in required_fields if field not in credentials]
+        if missing_fields:
+            logger.error(f"Missing required {platform} credential fields: {', '.join(missing_fields)}")
+            return False
+        
+        # Check for placeholder values
+        for field, placeholders in placeholder_values.items():
+            if credentials.get(field) in placeholders:
+                logger.error(f"{platform} credential field '{field}' contains placeholder value")
+                return False
+        
+        # Check minimum length for security
+        for field in required_fields:
+            if len(str(credentials.get(field, ''))) < 10:
+                logger.error(f"{platform} credential field '{field}' is too short")
+                return False
+        
+        logger.info(f"{platform} credentials validation passed")
+        return True
+        
+    except Exception as e:
+        logger.error(f"Error validating {platform} credentials: {str(e)}")
+        return False
+
+def get_validated_secret(secret_name: str, platform: str) -> Dict[str, Any]:
+    """
+    Get and validate secret for a specific platform
+    """
+    try:
+        credentials = get_secret(secret_name)
+        
+        if not validate_api_credentials(credentials, platform):
+            raise APIError(f"Invalid {platform} credentials", 500, "ConfigurationError")
+        
+        return credentials
+        
+    except APIError:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting validated secret for {platform}: {str(e)}")
+        raise APIError(f"Failed to retrieve {platform} credentials", 500, "ConfigurationError")
+
+def clear_secret_cache(secret_name: str = None):
+    """
+    Clear secret cache for a specific secret or all secrets
+    """
+    try:
+        if not hasattr(get_secret, 'cache'):
+            return
+        
+        if secret_name:
+            if secret_name in get_secret.cache:
+                del get_secret.cache[secret_name]
+                logger.info(f"Cleared cache for secret: {secret_name}")
+        else:
+            get_secret.cache.clear()
+            logger.info("Cleared all secret cache")
+            
+    except Exception as e:
+        logger.warning(f"Error clearing secret cache: {str(e)}")

@@ -13,32 +13,22 @@ from decimal import Decimal
 from typing import Dict, List, Any, Optional
 from botocore.exceptions import ClientError
 
+# Configure logging first
+logger = logging.getLogger()
+logger.setLevel(os.environ.get('LOG_LEVEL', 'INFO'))
+
 # Import shared utilities
 try:
     from shared_utils import (
-        get_secret, safe_decimal, get_current_timestamp, get_ttl_timestamp,
+        get_secret, get_validated_secret, safe_decimal, get_current_timestamp, get_ttl_timestamp,
         generate_item_hash, batch_write_items, log_execution_metrics,
-        RateLimiter, retry_with_backoff, clean_card_name
+        RateLimiter, retry_with_backoff, clean_card_name, APIError,
+        validate_api_credentials
     )
 except ImportError:
-    # Fallback implementations
-    def get_secret(secret_name):
-        return {"client_id": "test", "client_secret": "test", "sandbox": "true"}
-    
-    def safe_decimal(value, default=None):
-        try:
-            return Decimal(str(value)) if value is not None else (default or Decimal('0'))
-        except:
-            return default or Decimal('0')
-    
-    def get_current_timestamp():
-        return datetime.now(timezone.utc).isoformat()
-    
-    def get_ttl_timestamp(hours=24):
-        return int((datetime.now(timezone.utc) + timedelta(hours=hours)).timestamp())
-    
-    def log_execution_metrics(name, start_time, processed=0, errors=0):
-        print(f"METRICS: {name} - {time.time() - start_time:.2f}s")
+    # This should not happen in production as shared_utils should always be available
+    logger.error("Failed to import shared utilities - this indicates a deployment issue")
+    raise ImportError("Shared utilities layer not found - check Lambda layer configuration")
 
 # Configure logging
 logger = logging.getLogger()
@@ -59,14 +49,29 @@ class EbayAPIClient:
         self._initialize_credentials()
     
     def _initialize_credentials(self):
-        """Initialize eBay API credentials from Secrets Manager"""
+        """Initialize eBay API credentials from Secrets Manager with comprehensive error handling"""
         try:
-            self.credentials = get_secret(os.environ['EBAY_CREDENTIALS_SECRET'])
-            self.is_sandbox = self.credentials.get('sandbox', 'true').lower() == 'true'
+            # Validate environment variable
+            secret_name = os.environ.get('EBAY_CREDENTIALS_SECRET')
+            if not secret_name:
+                raise ValueError("EBAY_CREDENTIALS_SECRET environment variable not set")
+            
+            logger.info(f"Loading eBay credentials from secret: {secret_name}")
+            
+            # Retrieve and validate credentials using the new utility function
+            self.credentials = get_validated_secret(secret_name, 'ebay')
+            
+            # Determine sandbox mode
+            self.is_sandbox = str(self.credentials.get('sandbox', 'true')).lower() == 'true'
+            
             logger.info(f"eBay API initialized in {'sandbox' if self.is_sandbox else 'production'} mode")
+            
+        except APIError:
+            # Re-raise APIError from get_validated_secret
+            raise
         except Exception as e:
             logger.error(f"Failed to load eBay credentials: {str(e)}")
-            raise
+            raise APIError(f"eBay credential initialization failed: {str(e)}", 500, "ConfigurationError")
     
     def _get_base_urls(self):
         """Get base URLs for eBay API endpoints"""

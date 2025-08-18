@@ -66,19 +66,20 @@ class CardArbitrageStack(cdk.Stack):
             )
         )
         
-        self.tcg_credentials = secretsmanager.Secret(self, "TCGCredentials",
-            description="TCG Player API credentials", 
-            secret_name="card-arbitrage/tcg-credentials",
-            generate_secret_string=secretsmanager.SecretStringGenerator(
-                secret_string_template=json.dumps({
-                    "public_key": "your-tcg-public-key",
-                    "private_key": "your-tcg-private-key",
-                    "sandbox": "true"
-                }),
-                generate_string_key="placeholder",
-                exclude_characters='"\\/'
-            )
-        )
+        # TCG Player API credentials - commented out as not available
+        # self.tcg_credentials = secretsmanager.Secret(self, "TCGCredentials",
+        #     description="TCG Player API credentials", 
+        #     secret_name="card-arbitrage/tcg-credentials",
+        #     generate_secret_string=secretsmanager.SecretStringGenerator(
+        #         secret_string_template=json.dumps({
+        #             "public_key": "your-tcg-public-key",
+        #             "private_key": "your-tcg-private-key",
+        #             "sandbox": "true"
+        #         }),
+        #         generate_string_key="placeholder",
+        #         exclude_characters='"\\/'
+        #     )
+        # )
     
     def create_dynamodb_tables(self):
         """Create DynamoDB tables with proper configuration"""
@@ -98,7 +99,7 @@ class CardArbitrageStack(cdk.Stack):
             removal_policy=RemovalPolicy.DESTROY,
             point_in_time_recovery=True,
             global_secondary_indexes=[
-                dynamodb.GlobalSecondaryIndex(
+                dynamodb.GlobalSecondaryIndexProps(
                     index_name="card-name-index",
                     partition_key=dynamodb.Attribute(
                         name="card_name", 
@@ -109,7 +110,7 @@ class CardArbitrageStack(cdk.Stack):
                         type=dynamodb.AttributeType.NUMBER
                     )
                 ),
-                dynamodb.GlobalSecondaryIndex(
+                dynamodb.GlobalSecondaryIndexProps(
                     index_name="platform-index",
                     partition_key=dynamodb.Attribute(
                         name="platform", 
@@ -139,7 +140,7 @@ class CardArbitrageStack(cdk.Stack):
             removal_policy=RemovalPolicy.DESTROY,
             point_in_time_recovery=True,
             global_secondary_indexes=[
-                dynamodb.GlobalSecondaryIndex(
+                dynamodb.GlobalSecondaryIndexProps(
                     index_name="profit-margin-index",
                     partition_key=dynamodb.Attribute(
                         name="status", 
@@ -150,7 +151,7 @@ class CardArbitrageStack(cdk.Stack):
                         type=dynamodb.AttributeType.NUMBER
                     )
                 ),
-                dynamodb.GlobalSecondaryIndex(
+                dynamodb.GlobalSecondaryIndexProps(
                     index_name="platform-pair-index",
                     partition_key=dynamodb.Attribute(
                         name="platform_pair", 
@@ -216,7 +217,7 @@ class CardArbitrageStack(cdk.Stack):
             'OPPORTUNITIES_TABLE_NAME': self.opportunities_table.table_name,
             'NOTIFICATION_TOPIC_ARN': self.notification_topic.topic_arn,
             'EBAY_CREDENTIALS_SECRET': self.ebay_credentials.secret_arn,
-            'TCG_CREDENTIALS_SECRET': self.tcg_credentials.secret_arn,
+            # 'TCG_CREDENTIALS_SECRET': self.tcg_credentials.secret_arn,  # Commented out - no TCG API access
             'LOG_LEVEL': 'INFO'
         }
         
@@ -245,18 +246,18 @@ class CardArbitrageStack(cdk.Stack):
             reserved_concurrent_executions=10
         )
         
-        # TCG Player Scraper Lambda
-        self.tcg_scraper_lambda = lambda_.Function(self, "TCGScraper",
-            runtime=lambda_.Runtime.PYTHON_3_9,
-            handler="handler.lambda_handler",
-            code=lambda_.Code.from_asset("lambda_functions/tcg_scraper"),
-            layers=[self.shared_layer],
-            environment=common_env,
-            timeout=Duration.minutes(10),
-            memory_size=1024,
-            retry_attempts=2,
-            reserved_concurrent_executions=10
-        )
+        # TCG Player Scraper Lambda - commented out as no API access
+        # self.tcg_scraper_lambda = lambda_.Function(self, "TCGScraper",
+        #     runtime=lambda_.Runtime.PYTHON_3_9,
+        #     handler="handler.lambda_handler",
+        #     code=lambda_.Code.from_asset("lambda_functions/tcg_scraper"),
+        #     layers=[self.shared_layer],
+        #     environment=common_env,
+        #     timeout=Duration.minutes(10),
+        #     memory_size=1024,
+        #     retry_attempts=2,
+        #     reserved_concurrent_executions=10
+        # )
         
         # Arbitrage Detector Lambda
         self.arbitrage_detector_lambda = lambda_.Function(self, "ArbitrageDetector",
@@ -305,7 +306,7 @@ class CardArbitrageStack(cdk.Stack):
         # DynamoDB permissions
         self.listings_table.grant_read_write_data(self.api_handler_lambda)
         self.listings_table.grant_read_write_data(self.ebay_scraper_lambda)
-        self.listings_table.grant_read_write_data(self.tcg_scraper_lambda)
+        # self.listings_table.grant_read_write_data(self.tcg_scraper_lambda)  # Commented out - no TCG scraper
         self.listings_table.grant_read_data(self.arbitrage_detector_lambda)
         
         self.opportunities_table.grant_read_write_data(self.api_handler_lambda)
@@ -314,7 +315,7 @@ class CardArbitrageStack(cdk.Stack):
         
         # Secrets Manager permissions
         self.ebay_credentials.grant_read(self.ebay_scraper_lambda)
-        self.tcg_credentials.grant_read(self.tcg_scraper_lambda)
+        # self.tcg_credentials.grant_read(self.tcg_scraper_lambda)  # Commented out - no TCG scraper
         
         # SNS permissions
         self.notification_topic.grant_publish(self.notification_lambda)
@@ -439,17 +440,18 @@ class CardArbitrageStack(cdk.Stack):
             )
         )
         
-        scrape_tcg_task = tasks.LambdaInvoke(self, "ScrapeTCGTask",
-            lambda_function=self.tcg_scraper_lambda,
-            output_path="$.Payload",
-            retry_on_service_exceptions=True,
-            retry=sfn.RetryProps(
-                errors=["States.TaskFailed", "States.ALL"],
-                interval=Duration.seconds(30),
-                max_attempts=3,
-                backoff_rate=2.0
-            )
-        )
+        # TCG Scraper task - commented out as no API access
+        # scrape_tcg_task = tasks.LambdaInvoke(self, "ScrapeTCGTask",
+        #     lambda_function=self.tcg_scraper_lambda,
+        #     output_path="$.Payload",
+        #     retry_on_service_exceptions=True,
+        #     retry=sfn.RetryProps(
+        #         errors=["States.TaskFailed", "States.ALL"],
+        #         interval=Duration.seconds(30),
+        #         max_attempts=3,
+        #         backoff_rate=2.0
+        #     )
+        # )
         
         detect_arbitrage_task = tasks.LambdaInvoke(self, "DetectArbitrageTask",
             lambda_function=self.arbitrage_detector_lambda,
@@ -468,10 +470,14 @@ class CardArbitrageStack(cdk.Stack):
             output_path="$.Payload"
         )
         
-        # Define the workflow
-        parallel_scraping = sfn.Parallel(self, "ParallelScraping")\
-            .branch(scrape_ebay_task)\
-            .branch(scrape_tcg_task)
+        # Define the workflow - only eBay scraping for now since TCG API is not available
+        # When TCG API access is available, uncomment the parallel execution:
+        # parallel_scraping = sfn.Parallel(self, "ParallelScraping")\
+        #     .branch(scrape_ebay_task)\
+        #     .branch(scrape_tcg_task)
+        
+        # For now, just run eBay scraping directly
+        parallel_scraping = scrape_ebay_task
         
         check_opportunities = sfn.Choice(self, "CheckOpportunities")\
             .when(
@@ -565,9 +571,13 @@ class CardArbitrageStack(cdk.Stack):
             value=self.api.url,
             description="API Gateway endpoint URL"
         )
-        cdk.CfnOutput(self, "WebsiteBucketName",
+        cdk.CfnOutput(self, "WebsiteBucket", 
             value=self.website_bucket.bucket_name,
             description="S3 website bucket name"
+        )
+        cdk.CfnOutput(self, "WebsiteUrl",
+            value=f"http://{self.website_bucket.bucket_website_domain_name}",
+            description="Website URL"
         )
         cdk.CfnOutput(self, "ListingsTableName",
             value=self.listings_table.table_name,
@@ -585,6 +595,11 @@ class CardArbitrageStack(cdk.Stack):
             value=self.ebay_credentials.secret_name,
             description="eBay credentials secret name"
         )
+        # TCG credentials output commented out - no API access
+        # cdk.CfnOutput(self, "TCGCredentialsSecret",
+        #     value=self.tcg_credentials.secret_name,
+        #     description="TCG Player credentials secret name"
+        # )
 
 app = cdk.App()
 CardArbitrageStack(app, "CardArbitrageStack", 
